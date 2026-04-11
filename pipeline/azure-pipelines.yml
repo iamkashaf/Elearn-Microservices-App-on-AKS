@@ -1,0 +1,226 @@
+# =========================
+# CI TRIGGER
+# =========================
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    include:
+      - app/*
+      - k8s/*
+      - terraform/*
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+
+# =========================
+# 🔧 VARIABLES
+# =========================
+variables:
+  ACR_NAME: devopsacr12345678
+  AKS_RG: devops-rg
+  AKS_NAME: devops-aks
+  IMAGE_TAG: latest
+
+# =========================
+# STAGES
+# =========================
+stages:
+
+# =========================
+# TERRAFORM
+# =========================
+- stage: Terraform
+  displayName: " Terraform Infrastructure Provisioning"
+  jobs:
+  - job: Terraform_Deploy
+    displayName: "Deploy Infrastructure"
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - script: |
+        cd terraform
+        terraform init
+        terraform apply -auto-approve
+      displayName: "Terraform Init & Apply"
+
+# =========================
+#  CODE QUALITY (SAST)
+# =========================
+- stage: Code_Quality
+  displayName: " Code Quality Scan (SonarQube)"
+  jobs:
+  - job: Sonar_Scan
+    displayName: "Run SonarQube Analysis"
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - script: |
+        docker run --rm \
+        -e SONAR_HOST_URL=$(SONAR_HOST_URL) \
+        -e SONAR_LOGIN=$(SONAR_TOKEN) \
+        -v $(System.DefaultWorkingDirectory):/usr/src \
+        sonarsource/sonar-scanner-cli
+      displayName: "Execute SonarQube Scanner"
+
+# =========================
+#  DEPENDENCY SCAN (SCA)
+# =========================
+- stage: Dependency_Scan
+  displayName: "Dependency Vulnerability Scan (Snyk)"
+  jobs:
+  - job: Snyk
+    displayName: "Run Snyk Scan"
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - script: |
+        npm install -g snyk
+        snyk auth $(SNYK_TOKEN)
+        snyk test
+      displayName: "Execute Snyk Scan"
+
+# =========================
+# IaC SCAN
+# =========================
+- stage: Infra_Scan
+  displayName: " Terraform Security Scan (Checkov)"
+  jobs:
+  - job: Checkov
+    displayName: "Run Checkov Scan"
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - script: |
+        pip install checkov
+        checkov -d terraform/
+      displayName: "Execute Checkov Scan"
+
+# =========================
+#  BUILD & PUSH
+# =========================
+- stage: Build
+  displayName: " Build & Push Docker Images"
+  jobs:
+  - job: Build_Push
+    displayName: "Build and Push Images"
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+
+    - task: AzureCLI@2
+      displayName: "Login to Azure Container Registry"
+      inputs:
+        azureSubscription: 'azure-service-connection'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az acr login --name $(ACR_NAME)
+
+    - script: |
+        docker build -t $(ACR_NAME).azurecr.io/backend:$(IMAGE_TAG) app/backend
+        docker push $(ACR_NAME).azurecr.io/backend:$(IMAGE_TAG)
+      displayName: "Build & Push Backend Image"
+
+    - script: |
+        docker build -t $(ACR_NAME).azurecr.io/frontend:$(IMAGE_TAG) app/frontend
+        docker push $(ACR_NAME).azurecr.io/frontend:$(IMAGE_TAG)
+      displayName: "Build & Push Frontend Image"
+
+# =========================
+#  IMAGE SCAN
+# =========================
+- stage: Image_Scan
+  displayName: "🔍 Container Image Security Scan (Trivy)"
+  dependsOn: Build
+  jobs:
+  - job: Trivy
+    displayName: "Run Trivy Scan"
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+    - script: |
+        docker run --rm aquasec/trivy image $(ACR_NAME).azurecr.io/backend:latest
+        docker run --rm aquasec/trivy image $(ACR_NAME).azurecr.io/frontend:latest
+      displayName: "Execute Trivy Scan"
+
+# =========================
+#  APPROVAL
+# =========================
+- stage: Approval
+  displayName: " Manual Approval"
+  dependsOn: Image_Scan
+  jobs:
+  - job: WaitForApproval
+    displayName: "Approval Gate"
+    pool: server
+    steps:
+    - task: ManualValidation@0
+      displayName: "Approve Deployment"
+      inputs:
+        notifyUsers: 'your-email@example.com'
+        instructions: 'Approve deployment to AKS'
+        onTimeout: 'reject'
+
+# =========================
+#  DEPLOY
+# =========================
+- stage: Deploy
+  displayName: " Deploy to AKS"
+  dependsOn: Approval
+  jobs:
+  - job: AKS_Deploy
+    displayName: "Deploy Application"
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+
+    - task: AzureCLI@2
+      displayName: "Connect to AKS Cluster"
+      inputs:
+        azureSubscription: 'azure-service-connection'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az aks get-credentials --name $(AKS_NAME) --resource-group $(AKS_RG)
+
+    - script: |
+        kubectl apply -f k8s/mysql-secret.yaml
+        kubectl apply -f k8s/mysql-pvc.yaml
+        kubectl apply -f k8s/mysql.yaml
+        kubectl apply -f k8s/backend.yaml
+        kubectl apply -f k8s/frontend.yaml
+      displayName: "Apply Kubernetes Manifests"
+
+# =========================
+#  ROLLBACK
+# =========================
+- stage: Rollback
+  displayName: " Rollback on Failure"
+  dependsOn: Deploy
+  condition: failed()
+  jobs:
+  - job: RollbackJob
+    displayName: "Rollback Deployment"
+    pool:
+      vmImage: ubuntu-latest
+    steps:
+
+    - task: AzureCLI@2
+      displayName: "Reconnect to AKS"
+      inputs:
+        azureSubscription: 'azure-service-connection'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az aks get-credentials --name $(AKS_NAME) --resource-group $(AKS_RG)
+
+    - script: |
+        kubectl rollout undo deployment backend
+        kubectl rollout undo deployment frontend
+      displayName: "Rollback Backend & Frontend"
